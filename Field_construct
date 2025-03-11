@@ -1,2 +1,27 @@
-for i in range(10):
-  print(1)
+import numpy as np
+from osgeo import gdal, osr
+from scipy.signal import fftconvolve
+import matplotlib.pyplot as plt
+
+def read_adf_gdal(file_path):
+    """GDAL读取ADF文件并处理空值"""
+    dataset = gdal.Open(file_path)
+    if not dataset:
+        raise FileNotFoundError(f"无法打开文件: {file_path}")
+    
+    # 读取基础信息
+    cols = dataset.RasterXSize
+    rows = dataset.RasterYSize
+    band = dataset.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    
+    # 转换数据为数组
+    data = band.ReadAsArray(0, 0, cols, rows).astype(np.float32)
+    geotrans = dataset.GetGeoTransform()
+    proj = dataset.GetProjection()
+    
+    # 替换空值为极小值并进行归一化
+    data_filled = np.where(data == nodata, 1e-10, data)
+    data_normalized = (data_filled - np.nanmin(data_filled)) / \
+                     (np.nanmax(data_filled) - np.nanmin(data_filled) + 1e-10)
+    return data_normalized, geotrans, proj
