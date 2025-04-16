@@ -1,0 +1,192 @@
+#对数据标准化
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from osgeo import gdal
+from matplotlib.colors import LinearSegmentedColormap
+
+# 设置字体为Times New Roman 12号
+font_path = fm.findfont('Times New Roman')
+font_prop = fm.FontProperties(fname=font_path, size=12)
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.size'] = 12
+
+# 读取栅格数据函数
+def read_tif(file_path):
+    dataset = gdal.Open(file_path)
+    if dataset is None:
+        print(f"无法打开文件: {file_path}")
+        return None
+    
+    band = dataset.GetRasterBand(1)
+    data = band.ReadAsArray().astype(np.float64)
+    
+    # 获取NoData值
+    nodata_val = band.GetNoDataValue()
+    if nodata_val is not None:
+        # 创建掩码，标记有效数据区域
+        mask = (data != nodata_val)
+    else:
+        # 如果没有设置NoData值，则检查NaN值
+        mask = ~np.isnan(data)
+    
+    # 获取地理信息
+    geotransform = dataset.GetGeoTransform()
+    projection = dataset.GetProjection()
+    
+    return data, geotransform, projection, mask
+
+# 归一化函数 (添加0.0001的偏移量)
+def normalize(data, mask=None):
+    # 如果提供了掩码，只对有效区域进行归一化
+    if mask is not None:
+        valid_data = data[mask]
+        if len(valid_data) == 0:  # 如果没有有效数据
+            return np.ones_like(data) * 0.0001
+        min_val = np.min(valid_data)
+        max_val = np.max(valid_data)
+    else:
+        min_val = np.min(data)
+        max_val = np.max(data)
+    
+    if max_val == min_val:
+        return np.ones_like(data) * 0.0001
+    
+    normalized = (data - min_val) / (max_val - min_val) + 0.0001
+    
+    # 如果提供了掩码，将无效区域设为0
+    if mask is not None:
+        normalized = normalized * mask
+    
+    return normalized
+
+# 熵权法计算权重
+def entropy_weight_method(normalized_data_list, mask=None):
+    # 计算熵值
+    entropy_list = []
+    for data in normalized_data_list:
+        # 如果提供了掩码，只对有效区域计算熵值
+        if mask is not None:
+            valid_data = data[mask]
+            # 计算比重 (只考虑有效区域)
+            p_ij = valid_data / np.sum(valid_data)
+        else:
+            # 计算比重
+            p_ij = data / np.sum(data)
+        
+        # 处理0值，因为ln(0)是无穷大
+        p_ij = np.where(p_ij == 0, 0.0001, p_ij)
+        # 计算熵值
+        if mask is not None:
+            e_j = -np.sum(p_ij * np.log(p_ij)) / np.log(len(valid_data))
+        else:
+            e_j = -np.sum(p_ij * np.log(p_ij)) / np.log(len(data.flatten()))
+        entropy_list.append(e_j)
+    
+    # 计算权重
+    weights = []
+    entropy_sum = sum([1 - e for e in entropy_list])
+    if entropy_sum == 0:
+        # 如果所有熵值都为1，则平均分配权重
+        weights = [1/len(normalized_data_list)] * len(normalized_data_list)
+    else:
+        for e in entropy_list:
+            weights.append((1 - e) / entropy_sum)
+    
+    return weights
+
+# 保存栅格文件
+def save_tif(data, geotransform, projection, output_path):
+    # 获取数据维度
+    rows, cols = data.shape
+    
+    # 创建输出文件
+    driver = gdal.GetDriverByName('GTiff')
+    output_dataset = driver.Create(output_path, cols, rows, 1, gdal.GDT_Float32)
+    
+    # 设置地理信息
+    output_dataset.SetGeoTransform(geotransform)
+    output_dataset.SetProjection(projection)
+    
+    # 写入数据
+    output_band = output_dataset.GetRasterBand(1)
+    output_band.WriteArray(data)
+    
+    # 关闭数据集
+    output_dataset = None
+
+# 主函数
+def main():
+    # 数据路径
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+    building_path = os.path.join(data_dir, 'building.tif')
+    financial_path = os.path.join(data_dir, 'finacial.tif')
+    population_path = os.path.join(data_dir, 'population.tif')
+    
+    # 读取数据
+    building_data, building_geo, building_proj, building_mask = read_tif(building_path)
+    financial_data, financial_geo, financial_proj, financial_mask = read_tif(financial_path)
+    population_data, population_geo, population_proj, population_mask = read_tif(population_path)
+    
+    # 创建统一掩码 - 只使用financial的掩码作为基准
+    combined_mask = financial_mask
+    print(f"使用financial掩码的有效数据点数量: {np.sum(combined_mask)}")
+    
+    # 归一化处理 - 应用掩码
+    building_norm = normalize(building_data, combined_mask)
+    financial_norm = normalize(financial_data, combined_mask)
+    population_norm = normalize(population_data, combined_mask)
+    
+    # 计算权重 - 只考虑有效区域
+    normalized_data_list = [building_norm, financial_norm, population_norm]
+    weights = entropy_weight_method(normalized_data_list, combined_mask)
+    print(f"计算得到的权重: {weights}")
+    
+    # 合并栅格 - 只在有效区域进行计算
+    combined_data = (building_norm * weights[0] + 
+                     financial_norm * weights[1] + 
+                     population_norm * weights[2])
+    
+    # 确保无效区域保持为0
+    combined_data = combined_data * combined_mask
+    
+    # 保存结果
+    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'combined_result.tif')
+    save_tif(combined_data, building_geo, building_proj, output_path)
+    
+    # 只保存合并后的数据为单个numpy文件
+    np.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'result.npy'), combined_data)
+    
+    # 绘制结果图像
+    plt.figure(figsize=(8, 8))  # 保持高宽比相等
+    
+    # 创建自定义颜色映射
+    colors = [(0.0, 'blue'), (0.5, 'green'), (1.0, 'red')]
+    cmap = LinearSegmentedColormap.from_list('custom_cmap', colors, N=256)
+    
+    # 绘制热力图
+    im = plt.imshow(combined_data, cmap=cmap)
+    
+    # 设置图例高度与图片高度相等
+    cbar = plt.colorbar(im, label='Normalized Value', fraction=0.046, pad=0.04)
+    
+    # 计算栅格中心点位置
+    rows, cols = combined_data.shape
+    center_y, center_x = rows // 2, cols // 2
+    
+    # 设置坐标轴从栅格中心向两边递增，间隔为10
+    x_ticks = np.arange(-center_x, cols - center_x, 10)
+    y_ticks = np.arange(-center_y, rows - center_y, 10)
+    plt.xticks(np.arange(0, cols, 10), x_ticks)
+    plt.yticks(np.arange(0, rows, 10), y_ticks)
+    
+    plt.title('Combined Result with Entropy Weight Method', fontproperties=font_prop)
+    # 去掉X和Y标注
+    
+    # 保存图像
+    plt.savefig(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'combined_result.png'), dpi=300, bbox_inches='tight')
+    plt.show()
+
+if __name__ == "__main__":
+    main()
